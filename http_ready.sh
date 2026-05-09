@@ -15,6 +15,8 @@ v_thread=500
 v_nmap_stats="60s"
 v_min_paral=200
 v_max_paral=400
+export v_workdir
+trap 'rm -rf "$v_workdir"' EXIT
 #-----------------------------
 #Generate Nmap file
 #-----------------------------
@@ -23,16 +25,16 @@ echo "$s_host_def"
 read -r -p "Hosts(s) : " v_host_def
 
 # Input validation: allow only safe characters (alphanumeric, dots, slashes, dashes, underscores)
-if [[ ! "$v_host_def" =~ ^[a-zA-Z0-9./_\-]+$ ]]; then
+if [[ ! "$v_host_def" =~ ^[a-zA-Z0-9./_,\-]+$ ]]; then
     echo "Error: invalid input '$v_host_def'" >&2
     exit 1
 fi
 
 if test -f "$v_host_def"; then
     if [[ $v_debug == 1 ]]; then
-        nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -stats-every "$v_nmap_stats" -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" >/dev/null 2>&1
+        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -stats-every "$v_nmap_stats" -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" >/dev/null 2>&1
     else
-        nmap -n --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" >/dev/null 2>&1
+        sudo nmap -n --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" >/dev/null 2>&1
     fi
 else
     if [[ $v_debug == 1 ]]; then
@@ -51,12 +53,12 @@ fi
 #-----------------------------
 #Generate function file
 #-----------------------------
-grep -v "Up" "$v_port_list" | while read -r line; do
+grep "Up" "$v_port_list" | while read -r line; do
     host=$(echo "$line" | grep -Eo '([0-9]{1,3}[\\.]){3}[0-9]{1,3}')
     if [[ $? == 0 ]]; then
         echo "------ host :$host ------" | tee -a "$v_host_ports" >/dev/null 2>&1
-        ports=$(echo "$line" | grep -Po '(?<= )([0-9]{1,})(?=/)')
-        if [[ $? == 0 ]]; then
+        ports=$(echo "$line" | grep -oE '[0-9]+/' | tr -d '/')
+        if [[ -n "$ports" ]]; then
             for y in $ports; do
                 echo "$host --- Ports: $y" | tee -a "$v_host_ports" >/dev/null 2>&1
             done
@@ -70,17 +72,19 @@ done
 probe_host_port() {
     local entry="$1"
     local wait="$2"
-    local host port
-    host=$(grep -Eo "^([0-9]{1,3}\.){3}[0-9]{1,3}" <<< "$entry")
-    port=$(grep -Po "(?<=Ports: )[0-9]+" <<< "$entry")
-    curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}\n" "http://${host}:${port}"
-    curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port}  +++ https://${host}:${port} --- https_code : %{response_code}\n" "https://${host}:${port}"
+    local host port out
+    host="${entry%% ---*}"
+    port="${entry##*Ports: }"
+    out="$v_workdir/results/${host}_${port}.tmp"
+    curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}\n" "http://${host}:${port}" >> "$out"
+    curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port} +++ https://${host}:${port} --- https_code : %{response_code}\n" "https://${host}:${port}" >> "$out"
 }
 export -f probe_host_port
 
 rm -f http_ready.txt
-grep -v "host" "$v_host_ports" | xargs -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait" \
-    | tee -a http_ready.txt | grep -v '000'
+mkdir -p "$v_workdir/results"
+grep -- '--- Ports:' "$v_host_ports" | xargs -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait"
+find "$v_workdir/results" -name '*.tmp' -exec cat {} + | tee http_ready.txt | grep -vE '(http|https)_code : 000'
 
 #-----------------------------
 #Output
