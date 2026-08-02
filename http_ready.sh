@@ -31,19 +31,13 @@ if [[ ! "$v_host_def" =~ ^[a-zA-Z0-9./_,\-]+$ ]]; then
 fi
 
 echo "[progress] Discovering live hosts..."
+v_disco_stats=""
+[[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
 (
     if test -f "$v_host_def"; then
-        if [[ $v_debug == 1 ]]; then
-            sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -stats-every "$v_nmap_stats" -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
-        else
-            sudo nmap -n --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
-        fi
+        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
     else
-        if [[ $v_debug == 1 ]]; then
-            sudo nmap -n --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn -stats-every "$v_nmap_stats" "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
-        else
-            sudo nmap -n --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
-        fi
+        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
     fi
 ) &
 discovery_pid=$!
@@ -60,11 +54,7 @@ fi
 
 echo "[progress] Scanning open ports on discovered hosts..."
 (
-    if [[ $v_debug == 1 ]]; then
-        sudo nmap -sS --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list"
-    else
-        sudo nmap -sT --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list"
-    fi
+    sudo nmap -n -T5 -sS --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" --max-retries 2 -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list"
 ) &
 scan_pid=$!
 while kill -0 "$scan_pid" 2>/dev/null; do
