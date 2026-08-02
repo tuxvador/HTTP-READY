@@ -1,4 +1,5 @@
 #!/bin/bash
+set -m
 set -uo pipefail
 #Function to detect all port responding to http request during a pentest
 #-------------------------
@@ -26,6 +27,20 @@ v_has_rustscan=0
 if command -v rustscan >/dev/null 2>&1; then
     v_has_rustscan=1
 fi
+# Stop the running scanner and exit cleanly on Ctrl-C / kill. Background jobs
+# ignore SIGINT (POSIX), so kill the scanner's process group with SIGTERM.
+v_scan_pid=""
+cleanup_scan() {
+    echo "" >&2
+    echo "[progress] Interrupted, stopping scanner..." >&2
+    if [[ -n "$v_scan_pid" ]]; then
+        kill -TERM -- "-$v_scan_pid" 2>/dev/null
+        sleep 1
+        kill -KILL -- "-$v_scan_pid" 2>/dev/null
+    fi
+    exit 130
+}
+trap cleanup_scan INT TERM
 #-----------------------------
 #Generate Nmap file
 #-----------------------------
@@ -39,26 +54,36 @@ if [[ ! "$v_host_def" =~ ^[a-zA-Z0-9./_,\-]+$ ]]; then
     exit 1
 fi
 
+# Authenticate in the foreground so backgrounded sudo (-n) never needs to
+# prompt on the terminal (job-controlled background groups would be stopped
+# by SIGTTIN when reading /dev/tty).
+echo "[progress] Checking sudo access..."
+if ! sudo -v; then
+    echo "[progress] sudo authentication failed" >&2
+    exit 1
+fi
+
 echo "[progress] Discovering live hosts..."
 v_disco_stats=""
 [[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
 (
     if test -f "$v_host_def"; then
-        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
     else
-        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
     fi
 ) &
-discovery_pid=$!
-while kill -0 "$discovery_pid" 2>/dev/null; do
+v_scan_pid=$!
+while kill -0 "$v_scan_pid" 2>/dev/null; do
     echo "[progress] Host discovery still running... $(date '+%H:%M:%S')"
     sleep 15
 done
-wait "$discovery_pid"
+wait "$v_scan_pid"
 if [[ $? -ne 0 ]]; then
     echo "[progress] Host discovery failed" >&2
     exit 1
 fi
+v_scan_pid=""
 
 if [[ ! -s "$v_host_list" ]]; then
     echo "[progress] No live hosts found, nothing to scan." >&2
@@ -76,31 +101,32 @@ echo "[progress] Scanning $(( $(wc -l < "$v_host_list") )) live host(s) with $v_
 case $v_port_scanner in
     masscan)
         (
-            sudo masscan -iL "$v_host_list" -p1-65535 --rate "$v_masscan_rate" -oG "$v_port_list"
+            sudo -n masscan -iL "$v_host_list" -p1-65535 --rate "$v_masscan_rate" -oG "$v_port_list" >"$v_workdir/masscan.log" 2>&1
         ) &
         ;;
     rustscan)
         v_rs_out="${v_workdir}/rustscan.out"
         (
-            rustscan -n -g -a "$v_host_list" > "$v_rs_out"
+            rustscan -n -g -a "$v_host_list" > "$v_rs_out" 2>"$v_workdir/rustscan.log"
         ) &
         ;;
     nmap)
         (
-            sudo nmap -n -T5 -sS --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" --max-retries 2 -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list"
+            sudo -n nmap -n -T5 -sS --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" --max-retries 2 -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list" >"$v_workdir/nmap.log" 2>&1
         ) &
         ;;
 esac
-scan_pid=$!
-while kill -0 "$scan_pid" 2>/dev/null; do
+v_scan_pid=$!
+while kill -0 "$v_scan_pid" 2>/dev/null; do
     echo "[progress] $v_port_scanner still running... $(date '+%H:%M:%S')"
     sleep 15
 done
-wait "$scan_pid"
+wait "$v_scan_pid"
 if [[ $? -ne 0 ]]; then
     echo "[progress] $v_port_scanner failed" >&2
     exit 1
 fi
+v_scan_pid=""
 
 echo "[progress] Extracting candidate host/port pairs..."
 count=0
@@ -163,17 +189,18 @@ echo "[progress] Probing $probe_count discovered port candidates (${v_thread} in
 (
     grep -- '--- Ports:' "$v_host_ports" | xargs -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait"
 ) &
-probe_pid=$!
-while kill -0 "$probe_pid" 2>/dev/null; do
+v_scan_pid=$!
+while kill -0 "$v_scan_pid" 2>/dev/null; do
     done_count=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
     echo "[progress] Probed $done_count/$probe_count candidates..."
     sleep 5
 done
-wait "$probe_pid"
+wait "$v_scan_pid"
 if [[ $? -ne 0 ]]; then
     echo "[progress] Probing failed" >&2
     exit 1
 fi
+v_scan_pid=""
 echo "[progress] Finished probing all candidates."
 find "$v_workdir/results" -name '*.tmp' -exec cat {} + | tee http_ready.txt | grep -vE '(http|https)_code : 000'
 
