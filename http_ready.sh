@@ -90,15 +90,15 @@ while IFS= read -r line; do
     fi
     host=$(echo "$line" | grep -Eo '([0-9]{1,3}[\\.]){3}[0-9]{1,3}')
     if [[ $? == 0 ]]; then
-        echo "------ host :$host ------" | tee -a "$v_host_ports" >/dev/null 2>&1
+        echo "------ host :$host ------" >> "$v_host_ports"
         ports=$(echo "$line" | grep -oE '[0-9]+/' | tr -d '/')
         if [[ -n "$ports" ]]; then
             for y in $ports; do
-                echo "$host --- Ports: $y" | tee -a "$v_host_ports" >/dev/null 2>&1
+                echo "$host --- Ports: $y" >> "$v_host_ports"
             done
         fi
     fi
-done < <(grep "Up" "$v_port_list")
+done < <(grep "Ports:" "$v_port_list")
 
 #-----------------------------
 #Compute result
@@ -110,7 +110,9 @@ probe_host_port() {
     host="${entry%% ---*}"
     port="${entry##*Ports: }"
     out="$v_workdir/results/${host}_${port}.tmp"
-    echo "[progress] probing http(s)://${host}:${port}" >&2
+    if [[ $v_debug == 1 ]]; then
+        echo "[progress] probing http(s)://${host}:${port}" >&2
+    fi
     curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}\n" "http://${host}:${port}" >> "$out"
     curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port} +++ https://${host}:${port} --- https_code : %{response_code}\n" "https://${host}:${port}" >> "$out"
 }
@@ -119,15 +121,21 @@ export -f probe_host_port
 rm -f http_ready.txt
 mkdir -p "$v_workdir/results"
 probe_count=$(grep -- '--- Ports:' "$v_host_ports" | wc -l | tr -d ' ')
-echo "[progress] Probing $probe_count discovered port candidates..."
-probe_index=0
-while IFS= read -r entry; do
-    probe_index=$((probe_index + 1))
-    if (( probe_index % 50 == 0 )); then
-        echo "[progress] Probed $probe_index/$probe_count candidates so far..."
-    fi
-    probe_host_port "$entry" "$v_wait"
-done < <(grep -- '--- Ports:' "$v_host_ports")
+echo "[progress] Probing $probe_count discovered port candidates (${v_thread} in parallel)..."
+(
+    grep -- '--- Ports:' "$v_host_ports" | xargs -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait"
+) &
+probe_pid=$!
+while kill -0 "$probe_pid" 2>/dev/null; do
+    done_count=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
+    echo "[progress] Probed $done_count/$probe_count candidates..."
+    sleep 5
+done
+wait "$probe_pid"
+if [[ $? -ne 0 ]]; then
+    echo "[progress] Probing failed" >&2
+    exit 1
+fi
 echo "[progress] Finished probing all candidates."
 find "$v_workdir/results" -name '*.tmp' -exec cat {} + | tee http_ready.txt | grep -vE '(http|https)_code : 000'
 
