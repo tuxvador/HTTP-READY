@@ -29,10 +29,15 @@ if command -v rustscan >/dev/null 2>&1; then
 fi
 # Stop the running scanner and exit cleanly on Ctrl-C / kill. Background jobs
 # ignore SIGINT (POSIX), so kill the scanner's process group with SIGTERM.
+# We `wait` on the scanner (not a sleep loop) so the INT/TERM trap fires reliably.
 v_scan_pid=""
+v_notify_pid=""
 cleanup_scan() {
     echo "" >&2
     echo "[progress] Interrupted, stopping scanner..." >&2
+    if [[ -n "$v_notify_pid" ]]; then
+        kill -TERM -- "-$v_notify_pid" 2>/dev/null
+    fi
     if [[ -n "$v_scan_pid" ]]; then
         kill -TERM -- "-$v_scan_pid" 2>/dev/null
         sleep 1
@@ -41,6 +46,31 @@ cleanup_scan() {
     exit 130
 }
 trap cleanup_scan INT TERM
+
+# Wait for the current scanner ($v_scan_pid) while printing periodic progress.
+# Optional $3 log file tail is shown for masscan's status (found=N, etc.).
+wait_scan() {
+    v_wait_msg="$1"
+    v_wait_int="$2"
+    v_wait_log="${3:-}"
+    (
+        while kill -0 "$v_scan_pid" 2>/dev/null; do
+            extra=""
+            if [[ -n "$v_wait_log" && -s "$v_wait_log" ]]; then
+                extra=" | $(tr '\r' '\n' < "$v_wait_log" | grep -v '^$' | tail -1)"
+            fi
+            echo "[progress] $v_wait_msg... $(date '+%H:%M:%S')$extra"
+            sleep "$v_wait_int"
+        done
+    ) &
+    v_notify_pid=$!
+    wait "$v_scan_pid"
+    local rc=$?
+    kill -TERM -- "-$v_notify_pid" 2>/dev/null
+    wait "$v_notify_pid" 2>/dev/null
+    v_notify_pid=""
+    return "$rc"
+}
 #-----------------------------
 #Generate Nmap file
 #-----------------------------
@@ -74,11 +104,7 @@ v_disco_stats=""
     fi
 ) &
 v_scan_pid=$!
-while kill -0 "$v_scan_pid" 2>/dev/null; do
-    echo "[progress] Host discovery still running... $(date '+%H:%M:%S')"
-    sleep 15
-done
-wait "$v_scan_pid"
+wait_scan "Host discovery still running" 15
 if [[ $? -ne 0 ]]; then
     echo "[progress] Host discovery failed" >&2
     exit 1
@@ -117,11 +143,11 @@ case $v_port_scanner in
         ;;
 esac
 v_scan_pid=$!
-while kill -0 "$v_scan_pid" 2>/dev/null; do
-    echo "[progress] $v_port_scanner still running... $(date '+%H:%M:%S')"
-    sleep 15
-done
-wait "$v_scan_pid"
+if [[ $v_port_scanner == masscan ]]; then
+    wait_scan "$v_port_scanner still running" 15 "$v_workdir/masscan.log"
+else
+    wait_scan "$v_port_scanner still running" 15
+fi
 if [[ $? -ne 0 ]]; then
     echo "[progress] $v_port_scanner failed" >&2
     exit 1
@@ -190,13 +216,20 @@ echo "[progress] Probing $probe_count discovered port candidates (${v_thread} in
     grep -- '--- Ports:' "$v_host_ports" | xargs -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait"
 ) &
 v_scan_pid=$!
-while kill -0 "$v_scan_pid" 2>/dev/null; do
-    done_count=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
-    echo "[progress] Probed $done_count/$probe_count candidates..."
-    sleep 5
-done
+(
+    while kill -0 "$v_scan_pid" 2>/dev/null; do
+        done_count=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
+        echo "[progress] Probed $done_count/$probe_count candidates..."
+        sleep 5
+    done
+) &
+v_notify_pid=$!
 wait "$v_scan_pid"
-if [[ $? -ne 0 ]]; then
+probe_rc=$?
+kill -TERM -- "-$v_notify_pid" 2>/dev/null
+wait "$v_notify_pid" 2>/dev/null
+v_notify_pid=""
+if [[ $probe_rc -ne 0 ]]; then
     echo "[progress] Probing failed" >&2
     exit 1
 fi

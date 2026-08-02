@@ -38,7 +38,7 @@ Input is validated — only alphanumeric characters, dots, slashes, dashes, unde
 3. **Extract host/port pairs** from the scanner output.
 4. **Probe** every open port with both `http://` and `https://` via `curl` in parallel (`v_thread` concurrent probes).
 
-Press `Ctrl-C` at any time to stop the current scan cleanly (the scanner's process group is terminated). Scanner status output is written to per-scanner logs, keeping the terminal output clean.
+Press `Ctrl-C` at any time to stop the current scan cleanly (the scanner's process group is terminated). Scanner status output is written to per-scanner logs (so it can't garble the terminal); masscan's live status (`% done, found=N`) is shown inline in the progress lines.
 
 Results are printed to stdout (filtering out lines where the response code itself is 000) and saved in full to `http_ready.txt`. Each open port is probed concurrently via per-port temp files to avoid output interleaving.
 
