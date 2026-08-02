@@ -17,6 +17,10 @@ v_min_paral=200
 v_max_paral=400
 export v_workdir
 trap 'rm -rf "$v_workdir"' EXIT
+v_has_rustscan=0
+if command -v rustscan >/dev/null 2>&1; then
+    v_has_rustscan=1
+fi
 #-----------------------------
 #Generate Nmap file
 #-----------------------------
@@ -30,65 +34,94 @@ if [[ ! "$v_host_def" =~ ^[a-zA-Z0-9./_,\-]+$ ]]; then
     exit 1
 fi
 
-echo "[progress] Discovering live hosts..."
-v_disco_stats=""
-[[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
-(
-    if test -f "$v_host_def"; then
-        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
-    else
-        sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+if [[ $v_has_rustscan == 1 ]]; then
+    echo "[progress] rustscan detected, using it for port scanning..."
+    v_rs_out="${v_workdir}/rustscan.out"
+    (
+        rustscan -n -g -b 4500 -t 1500 -a "$v_host_def" > "$v_rs_out"
+    ) &
+    rs_pid=$!
+    while kill -0 "$rs_pid" 2>/dev/null; do
+        echo "[progress] rustscan still running... $(date '+%H:%M:%S')"
+        sleep 15
+    done
+    wait "$rs_pid"
+    if [[ $? -ne 0 ]]; then
+        echo "[progress] rustscan failed" >&2
+        exit 1
     fi
-) &
-discovery_pid=$!
-while kill -0 "$discovery_pid" 2>/dev/null; do
-    echo "[progress] Host discovery still running... $(date '+%H:%M:%S')"
-    sleep 15
-done
-wait "$discovery_pid"
-
-if [[ $? -ne 0 ]]; then
-    echo "[progress] Host discovery failed" >&2
-    exit 1
-fi
-
-echo "[progress] Scanning open ports on discovered hosts..."
-(
-    sudo nmap -n -T5 -sS --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" --max-retries 2 -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list"
-) &
-scan_pid=$!
-while kill -0 "$scan_pid" 2>/dev/null; do
-    echo "[progress] Port scan still running... $(date '+%H:%M:%S')"
-    sleep 15
-done
-wait "$scan_pid"
-
-if [[ $? -ne 0 ]]; then
-    echo "[progress] Port scan failed" >&2
-    exit 1
-fi
-
-#-----------------------------
-#Generate function file
-#-----------------------------
-echo "[progress] Extracting candidate host/port pairs..."
-count=0
-while IFS= read -r line; do
-    count=$((count + 1))
-    if (( count % 100 == 0 )); then
-        echo "[progress] Processed $count candidate lines..."
-    fi
-    host=$(echo "$line" | grep -Eo '([0-9]{1,3}[\\.]){3}[0-9]{1,3}')
-    if [[ $? == 0 ]]; then
-        echo "------ host :$host ------" >> "$v_host_ports"
-        ports=$(echo "$line" | grep -oE '[0-9]+/' | tr -d '/')
-        if [[ -n "$ports" ]]; then
+    echo "[progress] Extracting candidate host/port pairs..."
+    count=0
+    while IFS= read -r line; do
+        count=$((count + 1))
+        if (( count % 100 == 0 )); then
+            echo "[progress] Processed $count candidate lines..."
+        fi
+        host=$(echo "$line" | grep -Eo '([0-9]{1,3}[\.]){3}[0-9]{1,3}')
+        if [[ -n "$host" ]]; then
+            echo "------ host :$host ------" >> "$v_host_ports"
+            ports=$(echo "$line" | sed -E 's/.*\[([0-9,]+)\]/\1/' | tr ',' ' ')
             for y in $ports; do
                 echo "$host --- Ports: $y" >> "$v_host_ports"
             done
         fi
+    done < "$v_rs_out"
+else
+    echo "[progress] Discovering live hosts with nmap..."
+    v_disco_stats=""
+    [[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
+    (
+        if test -f "$v_host_def"; then
+            sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+        else
+            sudo nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+        fi
+    ) &
+    discovery_pid=$!
+    while kill -0 "$discovery_pid" 2>/dev/null; do
+        echo "[progress] Host discovery still running... $(date '+%H:%M:%S')"
+        sleep 15
+    done
+    wait "$discovery_pid"
+    if [[ $? -ne 0 ]]; then
+        echo "[progress] Host discovery failed" >&2
+        exit 1
     fi
-done < <(grep "Ports:" "$v_port_list")
+
+    echo "[progress] Scanning open ports on discovered hosts..."
+    (
+        sudo nmap -n -T5 -sS --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" --max-retries 2 -stats-every "$v_nmap_stats" -iL "$v_host_list" -oG "$v_port_list"
+    ) &
+    scan_pid=$!
+    while kill -0 "$scan_pid" 2>/dev/null; do
+        echo "[progress] Port scan still running... $(date '+%H:%M:%S')"
+        sleep 15
+    done
+    wait "$scan_pid"
+    if [[ $? -ne 0 ]]; then
+        echo "[progress] Port scan failed" >&2
+        exit 1
+    fi
+
+    echo "[progress] Extracting candidate host/port pairs..."
+    count=0
+    while IFS= read -r line; do
+        count=$((count + 1))
+        if (( count % 100 == 0 )); then
+            echo "[progress] Processed $count candidate lines..."
+        fi
+        host=$(echo "$line" | grep -Eo '([0-9]{1,3}[\\.]){3}[0-9]{1,3}')
+        if [[ $? == 0 ]]; then
+            echo "------ host :$host ------" >> "$v_host_ports"
+            ports=$(echo "$line" | grep -oE '[0-9]+/' | tr -d '/')
+            if [[ -n "$ports" ]]; then
+                for y in $ports; do
+                    echo "$host --- Ports: $y" >> "$v_host_ports"
+                done
+            fi
+        fi
+    done < <(grep "Ports:" "$v_port_list")
+fi
 
 #-----------------------------
 #Compute result
@@ -103,8 +136,8 @@ probe_host_port() {
     if [[ $v_debug == 1 ]]; then
         echo "[progress] probing http(s)://${host}:${port}" >&2
     fi
-    curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}\n" "http://${host}:${port}" >> "$out"
-    curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port} +++ https://${host}:${port} --- https_code : %{response_code}\n" "https://${host}:${port}" >> "$out"
+    curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}\n" "http://${host}:${port}" >> "$out" || true
+    curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port} +++ https://${host}:${port} --- https_code : %{response_code}\n" "https://${host}:${port}" >> "$out" || true
 }
 export -f probe_host_port
 
