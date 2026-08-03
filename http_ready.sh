@@ -39,134 +39,23 @@ v_services_file="/usr/share/nmap/nmap-services"
 # Probe discovered ports while the scan is still running (masscan/nmap write
 # their greppable output incrementally). 0 disables and probes per tier only.
 v_stream=1
-# Status panel: [progress] messages are pinned to a small fixed block at the
-# BOTTOM of the terminal while results print as ordinary output above it.
-# Results therefore use the terminal's real scrollback -- mouse wheel,
-# shift+PageUp and tmux copy-mode all work on them as usual. (A scroll region
-# holding the results instead would keep them off the scrollback entirely, so
-# anything that scrolled past the top would be unrecoverable on screen.)
-# Height of the status block in lines; 0 disables the panel entirely.
-v_status_lines=6
 export v_workdir
-# split_stop is defined below; guard the call so the trap is safe if the script
-# exits before it exists. Restoring the scroll region on every exit path keeps a
-# failed or interrupted run from leaving the terminal clamped.
-trap 'declare -F split_stop >/dev/null && split_stop; rm -rf "$v_workdir"' EXIT
+trap 'rm -rf "$v_workdir"' EXIT
 #-----------------------------
-#Status panel
+#Output
 #-----------------------------
-# The terminal keeps a fixed status block at the bottom (progress messages)
-# while results print above it as ordinary scrolling output.
+# Progress messages and results are both printed as ordinary lines.
 #
-# The VT100 DECSTBM margin sequence sets the scrolling region to everything
-# ABOVE the status block, so results scroll through the normal screen area and
-# land in the terminal's scrollback. The status block sits below that margin
-# and is redrawn in place, so it never scrolls and never interleaves with
-# results. Escapes are written directly rather than through tput so this does
-# not depend on a terminfo entry being present.
-#
-# status() writes progress lines, kept in a ring buffer and redrawn in the
-# bottom block. Result lines are written to plain stdout and need no special
-# handling -- that is what keeps them scrollable.
-#
-# Falls back to plain sequential output when stdout is not a TTY (piped to a
-# file, run from cron) or when v_status_lines is 0.
-v_split=0
-v_status_file="${v_workdir}/status.lines"
-v_term_lines=0
-v_term_cols=80
-if [[ -t 1 && $v_status_lines -gt 0 ]]; then
-    # COLUMNS/LINES are not set in a non-interactive shell, so ask the terminal
-    # itself. Status lines are truncated to this width: a line longer than the
-    # terminal wraps, which would push other lines out of the fixed region.
-    v_term_lines=$( (tput lines 2>/dev/null) || echo 0 )
-    v_term_cols=$( (tput cols 2>/dev/null) || echo 0 )
-    [[ "$v_term_lines" =~ ^[0-9]+$ ]] || v_term_lines=0
-    [[ "$v_term_cols" =~ ^[0-9]+$ && $v_term_cols -gt 0 ]] || v_term_cols=80
-    # Need room for the status block, its separator, and a usable scrolling area.
-    if (( v_term_lines >= v_status_lines + 6 )); then
-        v_split=1
-    fi
-fi
-: > "$v_status_file"
-
-# Shorten $1 to $2 columns, marking the cut with an ellipsis so a truncated
-# value is never mistaken for a complete one.
-ellipsize() {
-    local s="$1" w="$2"
-    (( w > 1 )) || { printf '%s' "${s:0:w}"; return; }
-    if (( ${#s} > w )); then
-        printf '%s…' "${s:0:w-1}"
-    else
-        printf '%s' "$s"
-    fi
-}
-
-# First row of the pinned status block (the row above it is the separator).
-# Computed in split_start(); until then the panel is not drawn, so status()
-# before the split starts falls through to plain stdout.
-v_status_top=0
-
-split_start() {
-    (( v_split == 1 )) || return 0
-    v_status_top=$((v_term_lines - v_status_lines + 1))
-    # Scrolling region = everything above the separator, so results never
-    # overwrite the separator row or the pinned block. Results printed to
-    # stdout scroll here and enter the terminal's scrollback normally.
-    printf '\033[%d;%dr' 1 $((v_status_top - 2))
-    # Start output at the bottom of the scroll region so the panel is visible
-    # immediately rather than after the screen fills.
-    printf '\033[%d;1H' $((v_status_top - 2))
-}
-
-split_stop() {
-    (( v_split == 1 )) || return 0
-    printf '\033[r'                                    # reset scroll region to full screen
-    printf '\033[%d;1H' "$v_term_lines"                # cursor to bottom
-    printf '\033[?25h'                                 # ensure cursor visible
-    printf '\n'
-}
-
-# Redraw the pinned status block from the ring buffer. The cursor is saved and
-# restored so this never disturbs where results are scrolling above.
-split_redraw() {
-    (( v_split == 1 )) || return 0
-    (( v_status_top > 0 )) || return 0    # panel not started yet
-    local i=0 line row
-    printf '\033[s'                                    # save cursor
-    printf '\033[?25l'                                 # hide cursor while redrawing
-    # Separator on the row directly above the status block.
-    printf '\033[%d;1H\033[2K\033[2m%s\033[0m' $((v_status_top - 1)) \
-        "$(printf '%.0s─' $(seq 1 "$v_term_cols"))"
-    while IFS= read -r line; do
-        row=$((v_status_top + i))
-        (( row <= v_term_lines )) || break
-        printf '\033[%d;1H\033[2K%s' "$row" "$(ellipsize "$line" "$v_term_cols")"
-        i=$((i + 1))
-    done < "$v_status_file"
-    # Blank any unused rows so stale text does not linger.
-    while (( v_status_top + i <= v_term_lines )); do
-        printf '\033[%d;1H\033[2K' $((v_status_top + i))
-        i=$((i + 1))
-    done
-    printf '\033[u'                                    # restore cursor
-    printf '\033[?25h'
-}
-
-# Progress/status message: goes to the pinned block when active, stdout otherwise.
+# An earlier version pinned the progress messages to a fixed region using the
+# VT100 scroll-margin escape (DECSTBM). That kept the two apart on screen, but
+# how a terminal treats lines scrolled out of a partial scroll region is not
+# consistent between emulators -- in several of them those lines never reach
+# the scrollback, so results scrolling off the top were gone for good. Plain
+# output has no such dependency: scrollback, mouse wheel, shift+PageUp and
+# terminal search all behave exactly as they do for any other command.
 status() {
-    if (( v_split == 1 && v_status_top > 0 )); then
-        # Keep only the most recent v_status_lines messages; the separator sits
-        # on the row above the block, not inside it.
-        printf '%s\n' "$*" >> "$v_status_file"
-        local keep=$v_status_lines
-        tail -n "$keep" "$v_status_file" > "$v_status_file.tmp" 2>/dev/null && mv "$v_status_file.tmp" "$v_status_file"
-        split_redraw
-    else
-        printf '%s\n' "$*"
-    fi
+    printf '%s\n' "$*"
 }
-export v_status_lines v_split v_status_file
 
 # Result line: scrolls in the lower region (or plain stdout when not split).
 # Exported so probe_host_port() can use it from `xargs`-spawned subshells.
@@ -231,9 +120,6 @@ v_scan_pid=""
 v_notify_pid=""
 v_stream_pid=""
 cleanup_scan() {
-    # Restore the full-screen scroll region first: leaving DECSTBM set would
-    # confine the user's shell to the lower part of the terminal after exit.
-    split_stop
     echo "" >&2
     echo "[progress] Interrupted, stopping scanner..." >&2
     if [[ -n "$v_notify_pid" ]]; then
@@ -264,19 +150,10 @@ wait_scan() {
     v_wait_int="$2"
     v_wait_log="${3:-}"
     (
-        # This runs in a subshell, so it cannot update the parent's ring buffer
-        # in memory -- but status() works through the shared status file and
-        # writes escapes straight to the terminal, so both still apply here.
-        # The repeating "still running" line replaces its previous copy instead
-        # of filling the region, so the surrounding context stays visible.
         while kill -0 "$v_scan_pid" 2>/dev/null; do
             extra=""
             if [[ -n "$v_wait_log" && -s "$v_wait_log" ]]; then
                 extra=" | $(tr '\r' '\n' < "$v_wait_log" | grep -v '^$' | tail -1)"
-            fi
-            if (( v_split == 1 )); then
-                grep -v "^\[progress\] $v_wait_msg\.\.\. " "$v_status_file" > "$v_status_file.w" 2>/dev/null
-                mv "$v_status_file.w" "$v_status_file" 2>/dev/null
             fi
             status "[progress] $v_wait_msg... $(date '+%H:%M:%S')$extra"
             sleep "$v_wait_int"
@@ -311,10 +188,6 @@ if ! sudo -v; then
     echo "[progress] sudo authentication failed" >&2
     exit 1
 fi
-
-# Split the terminal only after the host prompt and the sudo password prompt,
-# so neither is drawn into (or cleared by) the status region.
-split_start
 
 status "[progress] Discovering live hosts..."
 v_disco_stats=""
