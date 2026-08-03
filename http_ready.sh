@@ -59,15 +59,34 @@ trap 'declare -F split_stop >/dev/null && split_stop; rm -rf "$v_workdir"' EXIT
 # file, run from cron) or when v_status_lines is 0.
 v_split=0
 v_status_file="${v_workdir}/status.lines"
+v_term_lines=0
+v_term_cols=80
 if [[ -t 1 && $v_status_lines -gt 0 ]]; then
+    # COLUMNS/LINES are not set in a non-interactive shell, so ask the terminal
+    # itself. Status lines are truncated to this width: a line longer than the
+    # terminal wraps, which would push other lines out of the fixed region.
     v_term_lines=$( (tput lines 2>/dev/null) || echo 0 )
-    [[ -n "$v_term_lines" ]] || v_term_lines=0
+    v_term_cols=$( (tput cols 2>/dev/null) || echo 0 )
+    [[ "$v_term_lines" =~ ^[0-9]+$ ]] || v_term_lines=0
+    [[ "$v_term_cols" =~ ^[0-9]+$ && $v_term_cols -gt 0 ]] || v_term_cols=80
     # Need room for the status region plus a usable scrolling area.
     if (( v_term_lines >= v_status_lines + 5 )); then
         v_split=1
     fi
 fi
 : > "$v_status_file"
+
+# Shorten $1 to $2 columns, marking the cut with an ellipsis so a truncated
+# value is never mistaken for a complete one.
+ellipsize() {
+    local s="$1" w="$2"
+    (( w > 1 )) || { printf '%s' "${s:0:w}"; return; }
+    if (( ${#s} > w )); then
+        printf '%s…' "${s:0:w-1}"
+    else
+        printf '%s' "$s"
+    fi
+}
 
 split_start() {
     (( v_split == 1 )) || return 0
@@ -92,7 +111,7 @@ split_redraw() {
     printf '\033[?25l'                                 # hide cursor while redrawing
     while IFS= read -r line; do
         i=$((i + 1))
-        printf '\033[%d;1H\033[2K%.*s' "$i" "$((${COLUMNS:-200}))" "$line"
+        printf '\033[%d;1H\033[2K%s' "$i" "$(ellipsize "$line" "$v_term_cols")"
     done < "$v_status_file"
     # Blank any unused rows so stale text does not linger.
     while (( i < v_status_lines )); do
@@ -101,7 +120,7 @@ split_redraw() {
     done
     # Separator on the last status row.
     printf '\033[%d;1H\033[2K\033[2m%s\033[0m' "$v_status_lines" \
-        "$(printf '%.0s─' $(seq 1 "${COLUMNS:-80}"))"
+        "$(printf '%.0s─' $(seq 1 "$v_term_cols"))"
     printf '\033[u'                                    # restore cursor
     printf '\033[?25h'
 }
@@ -300,7 +319,25 @@ if [[ ! -s "$v_host_list" ]]; then
     exit 0
 fi
 if (( v_split == 1 )); then
-    status "[progress] $(wc -l < "$v_host_list") live host(s): $(tr '\n' ' ' < "$v_host_list" | cut -c1-100)"
+    # List as many whole IPs as fit on one row and say how many are left over,
+    # rather than cutting the line mid-address.
+    v_hn=$(wc -l < "$v_host_list")
+    v_hprefix="[progress] $v_hn live host(s): "
+    v_hshown=0
+    v_hlist=""
+    while IFS= read -r v_ip; do
+        # +4 leaves room for the " (+N)" suffix.
+        if (( ${#v_hprefix} + ${#v_hlist} + ${#v_ip} + 8 > v_term_cols )); then
+            break
+        fi
+        v_hlist="${v_hlist}${v_ip} "
+        v_hshown=$((v_hshown + 1))
+    done < "$v_host_list"
+    if (( v_hshown < v_hn )); then
+        status "${v_hprefix}${v_hlist}(+$((v_hn - v_hshown)))"
+    else
+        status "${v_hprefix}${v_hlist% }"
+    fi
 fi
 
 v_port_scanner="nmap"
