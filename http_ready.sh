@@ -451,6 +451,11 @@ mkdir -p "$v_workdir/results" "$v_workdir/claim"
 
 build_tiers
 v_live_hosts=$(wc -l < "$v_host_list")
+# Set when any tier reports a scanner failure or a missing shard, so the final
+# summary can say the port list is not known to be complete.
+v_tier_failed=0
+v_shards=1
+v_shard_watch=""
 
 for v_tier in $(seq 1 "$v_tier_count"); do
     v_tier_file="$v_workdir/tier.$v_tier"
@@ -475,12 +480,26 @@ for v_tier in $(seq 1 "$v_tier_count"); do
             if (( v_shards > 1 )); then
                 status "[progress] $v_shards masscan shard(s), ${v_shard_rate} pps each (~${v_masscan_rate} pps total)"
             fi
+            # Each shard logs to its own file: sharing one log meant 10 writers
+            # truncating each other, losing the error message from whichever
+            # shard failed. masscan.log is a copy of shard 1's log, which is
+            # what wait_scan tails for the live status line.
+            # Each shard logs to its own file: sharing one log meant 10 writers
+            # truncating each other, losing the error message from whichever
+            # shard failed. Each shard also records its exit status, since a
+            # missing -oG file is not by itself proof of failure (a shard that
+            # finds nothing may legitimately write no output).
+            rm -f "$v_workdir/rc.$v_tier".*
             (
                 seq 1 "$v_shards" | xargs -r -P "$v_shards" -I{} \
-                    sudo -n masscan -iL "$v_host_list" -p"$v_tier_ports" \
-                        --rate "$v_shard_rate" --seed "$v_seed" --shard {}/"$v_shards" \
-                        -oG "$v_workdir/shard.$v_tier.{}" >"$v_workdir/masscan.log" 2>&1
+                    sh -c 'sudo -n masscan -iL "$1" -p"$2" --rate "$3" --seed "$4" \
+                               --shard "$5"/"$6" -oG "$7.$5" >"$8.$5" 2>&1
+                           echo $? > "$9.$5"' \
+                        _ "$v_host_list" "$v_tier_ports" "$v_shard_rate" "$v_seed" \
+                        {} "$v_shards" "$v_workdir/shard.$v_tier" \
+                        "$v_workdir/masscan.shard.$v_tier" "$v_workdir/rc.$v_tier"
             ) &
+            v_shard_watch="$v_workdir/masscan.shard.$v_tier.1"
             ;;
         rustscan)
             v_port_list="${v_workdir}/rustscan.$v_tier"
@@ -516,7 +535,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
     fi
 
     if [[ $v_port_scanner == masscan ]]; then
-        wait_scan "tier $v_tier/$v_tier_count ($v_port_scanner)" 15 "$v_workdir/masscan.log"
+        wait_scan "tier $v_tier/$v_tier_count ($v_port_scanner)" 15 "$v_shard_watch"
     else
         wait_scan "tier $v_tier/$v_tier_count ($v_port_scanner)" 15
     fi
@@ -526,9 +545,35 @@ for v_tier in $(seq 1 "$v_tier_count"); do
         wait "$v_stream_pid" 2>/dev/null
         v_stream_pid=""
     fi
+    # A tier that fails is reported but does not abort the run: the remaining
+    # tiers still cover different ports, and the results already probed are
+    # worth keeping. Silence here is what let a dead shard look like "0 found".
     if [[ $v_rc -ne 0 ]]; then
-        status "[progress] $v_port_scanner failed on tier $v_tier"
-        exit 1
+        status "[progress] WARNING: $v_port_scanner exited $v_rc on tier $v_tier -- results for this tier may be incomplete"
+        v_tier_failed=1
+    fi
+    # Every shard must have run to completion. A shard that dies (sudo timeout,
+    # adapter contention, resource limits) scans none of its slice, and that
+    # slice would otherwise be silently skipped -- the tier still reports "done"
+    # and the missing ports look like ports that simply are not open.
+    # Checked by exit status rather than output-file existence, because a shard
+    # that finds nothing may legitimately produce no -oG file.
+    if [[ $v_port_scanner == masscan ]]; then
+        v_bad=0
+        for v_s in $(seq 1 "$v_shards"); do
+            v_src="$v_workdir/rc.$v_tier.$v_s"
+            if [[ ! -s "$v_src" ]]; then
+                v_bad=$((v_bad + 1))                 # never finished
+            elif [[ "$(cat "$v_src")" != "0" ]]; then
+                v_bad=$((v_bad + 1))                 # exited non-zero
+            fi
+        done
+        if (( v_bad > 0 )); then
+            v_tier_failed=1
+            status "[progress] WARNING: $v_bad/$v_shards masscan shard(s) failed on tier $v_tier -- those ports were not scanned"
+            v_errline=$(grep -hiE 'FAIL|error|denied|permission' "$v_workdir/masscan.shard.$v_tier".* 2>/dev/null | head -1)
+            [[ -n "$v_errline" ]] && status "[progress]   masscan: $v_errline"
+        fi
     fi
     v_scan_pid=""
 
@@ -552,6 +597,9 @@ v_responded=$(grep -cvE '(http|https)_code : 000' http_ready.txt 2>/dev/null)
 [[ -n "$v_responded" ]] || v_responded=0
 v_probed=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
 status "[progress] Finished. $v_responded HTTP/HTTPS response(s) from $v_probed open port(s); full log in http_ready.txt"
+if (( v_tier_failed == 1 )); then
+    status "[progress] NOTE: at least one tier did not scan cleanly -- some ports were not covered. Re-run to confirm."
+fi
 
 #-----------------------------
 #Output

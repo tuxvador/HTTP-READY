@@ -59,6 +59,17 @@ Each tier is scanned by `v_masscan_jobs` masscan processes (default 10) run conc
 
 **`--rate` is per process, so it is divided across the shards** — 10 shards at the default 50000 run at 5000 pps each, keeping the aggregate at `v_masscan_rate` rather than 10x it. This matters because masscan is stateless and does not retry: oversubscribing the link does not raise an error, it silently drops replies and loses ports. Set `v_masscan_jobs=1` for a single process per tier.
 
+Each shard writes its own log and records its exit status. If a shard fails — sudo timing out mid-run, adapter contention, a resource limit — the run reports it:
+
+```
+[progress] WARNING: 2/10 masscan shard(s) failed on tier 3 -- those ports were not scanned
+[progress]   masscan: FAIL: permission denied
+...
+[progress] NOTE: at least one tier did not scan cleanly -- some ports were not covered. Re-run to confirm.
+```
+
+This matters because a dead shard is otherwise invisible: its slice of the port space is simply never scanned, the tier still reports "done", and the missing ports look exactly like ports that are not open. A failed tier no longer aborts the run — the remaining tiers cover different ports and the results already probed are kept — but the summary states that coverage is incomplete.
+
 Sharding parallelises the scan across processes; it does not raise the total packet rate. If masscan reports a sustained rate far below `v_masscan_rate` (e.g. ~2 kpps against a configured 50000), the link — not the process count — is the bottleneck, and `v_masscan_rate` should be lowered to match what the link actually sustains.
 
 ### Probing during the scan
@@ -129,6 +140,7 @@ Host : 192.168.1.30 Port :49152 +++ http://192.168.1.30:49152 --- http_code : 40
 ## Changes (latest)
 
 - **Split-screen output**: `[progress]` messages now stay in a fixed 15-line region at the top of the terminal (`v_status_lines`) while results scroll below it, so status and results no longer interleave. Disabled automatically when stdout is not a TTY; the scroll region is restored on every exit path including Ctrl-C
+- **Shard failures are reported**: a masscan shard that dies no longer silently skips its slice of the port space -- failed shards are counted, masscan's error is shown, and the summary flags that coverage is incomplete
 - **Parallel masscan**: each tier is now scanned by `v_masscan_jobs` concurrent masscan shards (default 10, via `--shard i/N` with a shared `--seed`). `--rate` is divided across them so the aggregate packet rate stays at `v_masscan_rate` instead of multiplying by the shard count
 - **Live results**: responding ports print as each probe returns, instead of only in the summary after every tier finished. `000` responses stay out of the terminal but remain in `http_ready.txt`
 - **Tiered scanning**: ports are now scanned in order of real-world frequency (from `nmap-services`) instead of numerically, so common HTTP ports are found first. Coverage is unchanged — the tiers are disjoint and sum to all 65535 ports. Cut points are configurable via `v_tiers`
