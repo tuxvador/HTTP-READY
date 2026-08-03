@@ -34,26 +34,35 @@ v_services_file="/usr/share/nmap/nmap-services"
 # Probe discovered ports while the scan is still running (masscan/nmap write
 # their greppable output incrementally). 0 disables and probes per tier only.
 v_stream=1
-# Split-screen output: keep [progress] lines in a fixed region at the top of the
-# terminal and let results scroll underneath, so the two never interleave.
-# Height of the progress region in lines; 0 disables the split entirely.
-v_status_lines=15
+# Status panel: [progress] messages are pinned to a small fixed block at the
+# BOTTOM of the terminal while results print as ordinary output above it.
+# Results therefore use the terminal's real scrollback -- mouse wheel,
+# shift+PageUp and tmux copy-mode all work on them as usual. (A scroll region
+# holding the results instead would keep them off the scrollback entirely, so
+# anything that scrolled past the top would be unrecoverable on screen.)
+# Height of the status block in lines; 0 disables the panel entirely.
+v_status_lines=6
 export v_workdir
 # split_stop is defined below; guard the call so the trap is safe if the script
 # exits before it exists. Restoring the scroll region on every exit path keeps a
 # failed or interrupted run from leaving the terminal clamped.
 trap 'declare -F split_stop >/dev/null && split_stop; rm -rf "$v_workdir"' EXIT
 #-----------------------------
-#Split-screen output
+#Status panel
 #-----------------------------
-# The terminal is divided into a fixed status region at the top (progress
-# messages) and a scrolling region below it (results), using the VT100
-# DECSTBM margin sequence. Escapes are written directly rather than through
-# tput so this does not depend on a terminfo entry being present.
+# The terminal keeps a fixed status block at the bottom (progress messages)
+# while results print above it as ordinary scrolling output.
 #
-# status() writes progress lines; they are kept in a ring buffer and the region
-# is redrawn in place, so the newest v_status_lines messages are always visible.
-# emit() writes result lines; they scroll normally in the lower region.
+# The VT100 DECSTBM margin sequence sets the scrolling region to everything
+# ABOVE the status block, so results scroll through the normal screen area and
+# land in the terminal's scrollback. The status block sits below that margin
+# and is redrawn in place, so it never scrolls and never interleaves with
+# results. Escapes are written directly rather than through tput so this does
+# not depend on a terminfo entry being present.
+#
+# status() writes progress lines, kept in a ring buffer and redrawn in the
+# bottom block. Result lines are written to plain stdout and need no special
+# handling -- that is what keeps them scrollable.
 #
 # Falls back to plain sequential output when stdout is not a TTY (piped to a
 # file, run from cron) or when v_status_lines is 0.
@@ -69,8 +78,8 @@ if [[ -t 1 && $v_status_lines -gt 0 ]]; then
     v_term_cols=$( (tput cols 2>/dev/null) || echo 0 )
     [[ "$v_term_lines" =~ ^[0-9]+$ ]] || v_term_lines=0
     [[ "$v_term_cols" =~ ^[0-9]+$ && $v_term_cols -gt 0 ]] || v_term_cols=80
-    # Need room for the status region plus a usable scrolling area.
-    if (( v_term_lines >= v_status_lines + 5 )); then
+    # Need room for the status block, its separator, and a usable scrolling area.
+    if (( v_term_lines >= v_status_lines + 6 )); then
         v_split=1
     fi
 fi
@@ -88,11 +97,21 @@ ellipsize() {
     fi
 }
 
+# First row of the pinned status block (the row above it is the separator).
+# Computed in split_start(); until then the panel is not drawn, so status()
+# before the split starts falls through to plain stdout.
+v_status_top=0
+
 split_start() {
     (( v_split == 1 )) || return 0
-    printf '\033[2J'                                   # clear screen
-    printf '\033[%d;%dr' $((v_status_lines + 1)) "$v_term_lines"   # scroll region below status
-    printf '\033[%d;1H' $((v_status_lines + 1))        # park cursor in scroll region
+    v_status_top=$((v_term_lines - v_status_lines + 1))
+    # Scrolling region = everything above the separator, so results never
+    # overwrite the separator row or the pinned block. Results printed to
+    # stdout scroll here and enter the terminal's scrollback normally.
+    printf '\033[%d;%dr' 1 $((v_status_top - 2))
+    # Start output at the bottom of the scroll region so the panel is visible
+    # immediately rather than after the screen fills.
+    printf '\033[%d;1H' $((v_status_top - 2))
 }
 
 split_stop() {
@@ -100,38 +119,42 @@ split_stop() {
     printf '\033[r'                                    # reset scroll region to full screen
     printf '\033[%d;1H' "$v_term_lines"                # cursor to bottom
     printf '\033[?25h'                                 # ensure cursor visible
+    printf '\n'
 }
 
-# Redraw the status region from the ring buffer. Cursor position is saved and
-# restored so this never disturbs where results are scrolling.
+# Redraw the pinned status block from the ring buffer. The cursor is saved and
+# restored so this never disturbs where results are scrolling above.
 split_redraw() {
     (( v_split == 1 )) || return 0
-    local i=0 line
+    (( v_status_top > 0 )) || return 0    # panel not started yet
+    local i=0 line row
     printf '\033[s'                                    # save cursor
     printf '\033[?25l'                                 # hide cursor while redrawing
+    # Separator on the row directly above the status block.
+    printf '\033[%d;1H\033[2K\033[2m%s\033[0m' $((v_status_top - 1)) \
+        "$(printf '%.0s─' $(seq 1 "$v_term_cols"))"
     while IFS= read -r line; do
+        row=$((v_status_top + i))
+        (( row <= v_term_lines )) || break
+        printf '\033[%d;1H\033[2K%s' "$row" "$(ellipsize "$line" "$v_term_cols")"
         i=$((i + 1))
-        printf '\033[%d;1H\033[2K%s' "$i" "$(ellipsize "$line" "$v_term_cols")"
     done < "$v_status_file"
     # Blank any unused rows so stale text does not linger.
-    while (( i < v_status_lines )); do
+    while (( v_status_top + i <= v_term_lines )); do
+        printf '\033[%d;1H\033[2K' $((v_status_top + i))
         i=$((i + 1))
-        printf '\033[%d;1H\033[2K' "$i"
     done
-    # Separator on the last status row.
-    printf '\033[%d;1H\033[2K\033[2m%s\033[0m' "$v_status_lines" \
-        "$(printf '%.0s─' $(seq 1 "$v_term_cols"))"
     printf '\033[u'                                    # restore cursor
     printf '\033[?25h'
 }
 
-# Progress/status message: goes to the top region when split, stdout otherwise.
+# Progress/status message: goes to the pinned block when active, stdout otherwise.
 status() {
-    if (( v_split == 1 )); then
-        # Keep only the most recent (v_status_lines - 1) messages; the last row
-        # is the separator.
+    if (( v_split == 1 && v_status_top > 0 )); then
+        # Keep only the most recent v_status_lines messages; the separator sits
+        # on the row above the block, not inside it.
         printf '%s\n' "$*" >> "$v_status_file"
-        local keep=$((v_status_lines - 1))
+        local keep=$v_status_lines
         tail -n "$keep" "$v_status_file" > "$v_status_file.tmp" 2>/dev/null && mv "$v_status_file.tmp" "$v_status_file"
         split_redraw
     else
@@ -291,9 +314,9 @@ split_start
 status "[progress] Discovering live hosts..."
 v_disco_stats=""
 [[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
-# When split, discovered IPs go to the host list only -- printing them would
-# scatter them through the results region. They are summarised in the status
-# region instead. Without the split, keep the original streaming `tee` output.
+# Discovered IPs are written to the host list; they are printed in full once
+# discovery finishes (see below) rather than streamed, so the status block is
+# not fighting the scan output for the same rows while nmap runs.
 if (( v_split == 1 )); then
     v_disco_sink="/dev/null"
 else
@@ -319,25 +342,11 @@ if [[ ! -s "$v_host_list" ]]; then
     exit 0
 fi
 if (( v_split == 1 )); then
-    # List as many whole IPs as fit on one row and say how many are left over,
-    # rather than cutting the line mid-address.
-    v_hn=$(wc -l < "$v_host_list")
-    v_hprefix="[progress] $v_hn live host(s): "
-    v_hshown=0
-    v_hlist=""
-    while IFS= read -r v_ip; do
-        # +4 leaves room for the " (+N)" suffix.
-        if (( ${#v_hprefix} + ${#v_hlist} + ${#v_ip} + 8 > v_term_cols )); then
-            break
-        fi
-        v_hlist="${v_hlist}${v_ip} "
-        v_hshown=$((v_hshown + 1))
-    done < "$v_host_list"
-    if (( v_hshown < v_hn )); then
-        status "${v_hprefix}${v_hlist}(+$((v_hn - v_hshown)))"
-    else
-        status "${v_hprefix}${v_hlist% }"
-    fi
+    # Results scroll in the normal screen area, so the host list can simply be
+    # printed there in full -- no need to fit it onto one status row.
+    printf '%s\n' "--- $(wc -l < "$v_host_list") live host(s) ---"
+    cat "$v_host_list"
+    status "[progress] $(wc -l < "$v_host_list") live host(s), scanning ports..."
 fi
 
 v_port_scanner="nmap"
