@@ -59,7 +59,7 @@ With `v_stream=1` (default), open ports are probed *while* the scanner is still 
 
 Press `Ctrl-C` at any time to stop the current scan cleanly (the scanner's process group is terminated). Results already probed are kept — `http_ready.txt` retains everything found by the completed tiers. Scanner status output is written to per-scanner logs (so it can't garble the terminal); masscan's live status (`% done, found=N`) is shown inline in the progress lines.
 
-Results are printed to stdout (filtering out lines where the response code itself is 000) and saved in full to `http_ready.txt`. Each open port is probed concurrently via per-port temp files to avoid output interleaving.
+Responding ports are printed to stdout **as each probe returns**, so hits appear live while the scan is still running rather than only in a summary at the end. Lines where the response code is `000` (nothing listening for that protocol) are suppressed from the terminal but still saved in full to `http_ready.txt`. Each open port is probed concurrently via per-port temp files to avoid output interleaving.
 
 ## Example — single host
 
@@ -100,6 +100,7 @@ Host : 192.168.1.30 Port :49152 +++ http://192.168.1.30:49152 --- http_code : 40
 
 ## Changes (latest)
 
+- **Live results**: responding ports print as each probe returns, instead of only in the summary after every tier finished. `000` responses stay out of the terminal but remain in `http_ready.txt`
 - **Tiered scanning**: ports are now scanned in order of real-world frequency (from `nmap-services`) instead of numerically, so common HTTP ports are found first. Coverage is unchanged — the tiers are disjoint and sum to all 65535 ports. Cut points are configurable via `v_tiers`
 - **Probing during the scan** (`v_stream=1`): open ports are probed while the scanner is still running, instead of only after it exits. A post-scan sweep still catches anything missed, so no result depends on the scanner flushing early
 - **Ctrl-C keeps partial results**: `http_ready.txt` now retains everything the completed tiers found instead of being lost with the temp directory

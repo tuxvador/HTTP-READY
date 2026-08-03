@@ -190,10 +190,13 @@ fi
 # Probe one host:port with both http and https. The output file name is derived
 # from host+port, so probing the same pair twice (streamer and final sweep)
 # simply rewrites the same file instead of duplicating a result.
+# Responding ports are printed as soon as curl returns, so hits appear live
+# rather than only in the summary at the end. Each line is emitted with a single
+# printf because probes run under `xargs -P` and separate writes would interleave.
 probe_host_port() {
     local entry="$1"
     local wait="$2"
-    local host port out
+    local host port out line
     host="${entry%% ---*}"
     port="${entry##*Ports: }"
     out="$v_workdir/results/${host}_${port}.tmp"
@@ -201,8 +204,16 @@ probe_host_port() {
         echo "[progress] probing http(s)://${host}:${port}" >&2
     fi
     : > "$out"
-    curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}\n" "http://${host}:${port}" >> "$out" || true
-    curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port} +++ https://${host}:${port} --- https_code : %{response_code}\n" "https://${host}:${port}" >> "$out" || true
+    line=$(curl -s -m "$wait" -o /dev/null -w "Host : ${host} Port :${port} +++ http://${host}:${port} --- http_code : %{response_code}" "http://${host}:${port}") || true
+    if [[ -n "$line" ]]; then
+        printf '%s\n' "$line" >> "$out"
+        [[ "$line" == *"http_code : 000" ]] || printf '%s\n' "$line"
+    fi
+    line=$(curl -s -m "$wait" -o /dev/null -k -w "Host : ${host} Port :${port} +++ https://${host}:${port} --- https_code : %{response_code}" "https://${host}:${port}") || true
+    if [[ -n "$line" ]]; then
+        printf '%s\n' "$line" >> "$out"
+        [[ "$line" == *"https_code : 000" ]] || printf '%s\n' "$line"
+    fi
 }
 export -f probe_host_port
 
@@ -336,8 +347,13 @@ for v_tier in $(seq 1 "$v_tier_count"); do
     find "$v_workdir/results" -name '*.tmp' -exec cat {} + > http_ready.txt 2>/dev/null
 done
 
-echo "[progress] Finished probing all candidates."
-find "$v_workdir/results" -name '*.tmp' -exec cat {} + | tee http_ready.txt | grep -vE '(http|https)_code : 000'
+# Responding ports were already printed live by probe_host_port, so the summary
+# only needs to write the full log and report the totals.
+find "$v_workdir/results" -name '*.tmp' -exec cat {} + > http_ready.txt 2>/dev/null
+v_responded=$(grep -cvE '(http|https)_code : 000' http_ready.txt 2>/dev/null)
+[[ -n "$v_responded" ]] || v_responded=0
+v_probed=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
+echo "[progress] Finished. $v_responded HTTP/HTTPS response(s) from $v_probed open port(s); full log in http_ready.txt"
 
 #-----------------------------
 #Output
