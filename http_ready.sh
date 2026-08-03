@@ -17,6 +17,13 @@ v_nmap_stats="60s"
 v_min_paral=200
 v_max_paral=400
 v_masscan_rate=50000
+# Number of masscan workers run concurrently (via xargs -P) using --shard, so
+# the tier's address/port space is split N ways. NOTE: --rate is per process, so
+# v_masscan_rate is divided across the workers to keep the aggregate packet rate
+# at v_masscan_rate rather than N times it. masscan is stateless and does not
+# retry, so oversubscribing the link shows up as missed ports, not as errors.
+# Set to 1 to run a single masscan process per tier.
+v_masscan_jobs=10
 # Tiered scanning: ports are scanned in order of real-world frequency (from
 # nmap-services), most common first, so HTTP hits on well-known ports land in
 # the results within seconds instead of after a full 65535-port sweep.
@@ -244,6 +251,14 @@ extract_pairs() {
     fi
 }
 
+# Merge the per-shard masscan outputs for the current tier into $v_port_list so
+# the parsers downstream only ever read one file. No-op for single-process
+# scanners, which write $v_port_list directly.
+collect_shards() {
+    [[ $v_port_scanner == masscan ]] || return 0
+    cat "$v_workdir/shard.$v_tier".* > "$v_port_list" 2>/dev/null || true
+}
+
 # Filter "host --- Ports: N" lines on stdin down to pairs not yet probed.
 filter_unprobed() {
     local line host port
@@ -282,8 +297,24 @@ for v_tier in $(seq 1 "$v_tier_count"); do
     echo "[progress] Tier $v_tier/$v_tier_count: $v_tier_n port(s) on $v_live_hosts host(s) with $v_port_scanner..."
     case $v_port_scanner in
         masscan)
+            # Split the tier across $v_masscan_jobs shards run concurrently.
+            # All shards must share one --seed or they do not partition the
+            # space correctly. --rate is per process, so divide it to keep the
+            # aggregate at v_masscan_rate.
+            v_shards=$v_masscan_jobs
+            (( v_shards < 1 )) && v_shards=1
+            v_shard_rate=$(( v_masscan_rate / v_shards ))
+            (( v_shard_rate < 1 )) && v_shard_rate=1
+            v_seed=$RANDOM$RANDOM
+            rm -f "$v_workdir/shard.$v_tier".*
+            if (( v_shards > 1 )); then
+                echo "[progress] $v_shards masscan shard(s), ${v_shard_rate} pps each (~${v_masscan_rate} pps total)"
+            fi
             (
-                sudo -n masscan -iL "$v_host_list" -p"$v_tier_ports" --rate "$v_masscan_rate" -oG "$v_port_list" >"$v_workdir/masscan.log" 2>&1
+                seq 1 "$v_shards" | xargs -r -P "$v_shards" -I{} \
+                    sudo -n masscan -iL "$v_host_list" -p"$v_tier_ports" \
+                        --rate "$v_shard_rate" --seed "$v_seed" --shard {}/"$v_shards" \
+                        -oG "$v_workdir/shard.$v_tier.{}" >"$v_workdir/masscan.log" 2>&1
             ) &
             ;;
         rustscan)
@@ -310,6 +341,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
         (
             while kill -0 "$v_scan_pid" 2>/dev/null; do
                 sleep 5
+                collect_shards
                 [[ -s "$v_port_list" ]] || continue
                 extract_pairs "$v_port_list" | filter_unprobed \
                     | xargs -r -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait" 2>/dev/null || true
@@ -336,6 +368,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
     v_scan_pid=""
 
     # Catch anything the streamer did not get to, then probe the leftovers.
+    collect_shards
     extract_pairs "$v_port_list" >> "$v_host_ports"
     v_todo="$v_workdir/todo.$v_tier"
     extract_pairs "$v_port_list" | filter_unprobed > "$v_todo"

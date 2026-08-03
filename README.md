@@ -12,7 +12,7 @@ During pentests, some ports are not identified by nmap as HTTP/HTTPS — this sc
 
 Optional port scanners (used when available, in this priority):
 
-1. `masscan` — very fast, raw-SYN scanner (`--rate` configurable via `v_masscan_rate`, default 50000)
+1. `masscan` — very fast, raw-SYN scanner (`--rate` configurable via `v_masscan_rate`, default 50000; run as `v_masscan_jobs` concurrent shards, default 10)
 2. `rustscan` — fast Rust port scanner
 3. `nmap` — fallback
 
@@ -52,6 +52,14 @@ Port order comes from the open-frequency column of `/usr/share/nmap/nmap-service
 | 4 | 57148 | everything with no `nmap-services` entry |
 
 The tiers are disjoint and sum to exactly 65535. Each tier is scanned, probed, and written to `http_ready.txt` before the next begins, so results accumulate as the run progresses. If `nmap-services` is missing, the script falls back to a single all-ports scan.
+
+### Parallel masscan shards
+
+Each tier is scanned by `v_masscan_jobs` masscan processes (default 10) run concurrently with `xargs -P`, using masscan's `--shard i/N` to split the address/port space. All shards share one `--seed`, which is what makes the split disjoint and complete: verified against an unsharded run, 10 shards emit exactly the same set of (host, port) pairs with no duplicates and no gaps.
+
+**`--rate` is per process, so it is divided across the shards** — 10 shards at the default 50000 run at 5000 pps each, keeping the aggregate at `v_masscan_rate` rather than 10x it. This matters because masscan is stateless and does not retry: oversubscribing the link does not raise an error, it silently drops replies and loses ports. Set `v_masscan_jobs=1` for a single process per tier.
+
+Sharding parallelises the scan across processes; it does not raise the total packet rate. If masscan reports a sustained rate far below `v_masscan_rate` (e.g. ~2 kpps against a configured 50000), the link — not the process count — is the bottleneck, and `v_masscan_rate` should be lowered to match what the link actually sustains.
 
 ### Probing during the scan
 
@@ -100,6 +108,7 @@ Host : 192.168.1.30 Port :49152 +++ http://192.168.1.30:49152 --- http_code : 40
 
 ## Changes (latest)
 
+- **Parallel masscan**: each tier is now scanned by `v_masscan_jobs` concurrent masscan shards (default 10, via `--shard i/N` with a shared `--seed`). `--rate` is divided across them so the aggregate packet rate stays at `v_masscan_rate` instead of multiplying by the shard count
 - **Live results**: responding ports print as each probe returns, instead of only in the summary after every tier finished. `000` responses stay out of the terminal but remain in `http_ready.txt`
 - **Tiered scanning**: ports are now scanned in order of real-world frequency (from `nmap-services`) instead of numerically, so common HTTP ports are found first. Coverage is unchanged — the tiers are disjoint and sum to all 65535 ports. Cut points are configurable via `v_tiers`
 - **Probing during the scan** (`v_stream=1`): open ports are probed while the scanner is still running, instead of only after it exits. A post-scan sweep still catches anything missed, so no result depends on the scanner flushing early
