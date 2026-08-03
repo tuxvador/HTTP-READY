@@ -207,6 +207,12 @@ probe_host_port() {
     host="${entry%% ---*}"
     port="${entry##*Ports: }"
     out="$v_workdir/results/${host}_${port}.tmp"
+    # Claim this pair before probing. The result file is not created until the
+    # first curl returns (up to $wait seconds), so a file-existence check alone
+    # lets the streamer's next pass re-probe a port whose probe is still in
+    # flight. mkdir is atomic: only one caller can create the claim directory,
+    # so concurrent passes and the post-scan sweep cannot double-probe.
+    mkdir "$v_workdir/claim/${host}_${port}" 2>/dev/null || return 0
     if [[ $v_debug == 1 ]]; then
         echo "[progress] probing http(s)://${host}:${port}" >&2
     fi
@@ -259,13 +265,16 @@ collect_shards() {
     cat "$v_workdir/shard.$v_tier".* > "$v_port_list" 2>/dev/null || true
 }
 
-# Filter "host --- Ports: N" lines on stdin down to pairs not yet probed.
+# Filter "host --- Ports: N" lines on stdin down to pairs not yet claimed. This
+# is an early cheap filter only -- probe_host_port() claims atomically, which is
+# what actually prevents double-probing. Checks the claim dir rather than the
+# result file because a probe in flight has a claim but no result yet.
 filter_unprobed() {
     local line host port
     while IFS= read -r line; do
         host="${line%% ---*}"
         port="${line##*Ports: }"
-        [[ -e "$v_workdir/results/${host}_${port}.tmp" ]] && continue
+        [[ -d "$v_workdir/claim/${host}_${port}" ]] && continue
         echo "$line"
     done
 }
@@ -282,7 +291,7 @@ probe_pairs_file() {
 }
 
 rm -f http_ready.txt
-mkdir -p "$v_workdir/results"
+mkdir -p "$v_workdir/results" "$v_workdir/claim"
 
 build_tiers
 v_live_hosts=$(wc -l < "$v_host_list")
