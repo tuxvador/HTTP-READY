@@ -34,8 +34,100 @@ v_services_file="/usr/share/nmap/nmap-services"
 # Probe discovered ports while the scan is still running (masscan/nmap write
 # their greppable output incrementally). 0 disables and probes per tier only.
 v_stream=1
+# Split-screen output: keep [progress] lines in a fixed region at the top of the
+# terminal and let results scroll underneath, so the two never interleave.
+# Height of the progress region in lines; 0 disables the split entirely.
+v_status_lines=15
 export v_workdir
-trap 'rm -rf "$v_workdir"' EXIT
+# split_stop is defined below; guard the call so the trap is safe if the script
+# exits before it exists. Restoring the scroll region on every exit path keeps a
+# failed or interrupted run from leaving the terminal clamped.
+trap 'declare -F split_stop >/dev/null && split_stop; rm -rf "$v_workdir"' EXIT
+#-----------------------------
+#Split-screen output
+#-----------------------------
+# The terminal is divided into a fixed status region at the top (progress
+# messages) and a scrolling region below it (results), using the VT100
+# DECSTBM margin sequence. Escapes are written directly rather than through
+# tput so this does not depend on a terminfo entry being present.
+#
+# status() writes progress lines; they are kept in a ring buffer and the region
+# is redrawn in place, so the newest v_status_lines messages are always visible.
+# emit() writes result lines; they scroll normally in the lower region.
+#
+# Falls back to plain sequential output when stdout is not a TTY (piped to a
+# file, run from cron) or when v_status_lines is 0.
+v_split=0
+v_status_file="${v_workdir}/status.lines"
+if [[ -t 1 && $v_status_lines -gt 0 ]]; then
+    v_term_lines=$( (tput lines 2>/dev/null) || echo 0 )
+    [[ -n "$v_term_lines" ]] || v_term_lines=0
+    # Need room for the status region plus a usable scrolling area.
+    if (( v_term_lines >= v_status_lines + 5 )); then
+        v_split=1
+    fi
+fi
+: > "$v_status_file"
+
+split_start() {
+    (( v_split == 1 )) || return 0
+    printf '\033[2J'                                   # clear screen
+    printf '\033[%d;%dr' $((v_status_lines + 1)) "$v_term_lines"   # scroll region below status
+    printf '\033[%d;1H' $((v_status_lines + 1))        # park cursor in scroll region
+}
+
+split_stop() {
+    (( v_split == 1 )) || return 0
+    printf '\033[r'                                    # reset scroll region to full screen
+    printf '\033[%d;1H' "$v_term_lines"                # cursor to bottom
+    printf '\033[?25h'                                 # ensure cursor visible
+}
+
+# Redraw the status region from the ring buffer. Cursor position is saved and
+# restored so this never disturbs where results are scrolling.
+split_redraw() {
+    (( v_split == 1 )) || return 0
+    local i=0 line
+    printf '\033[s'                                    # save cursor
+    printf '\033[?25l'                                 # hide cursor while redrawing
+    while IFS= read -r line; do
+        i=$((i + 1))
+        printf '\033[%d;1H\033[2K%.*s' "$i" "$((${COLUMNS:-200}))" "$line"
+    done < "$v_status_file"
+    # Blank any unused rows so stale text does not linger.
+    while (( i < v_status_lines )); do
+        i=$((i + 1))
+        printf '\033[%d;1H\033[2K' "$i"
+    done
+    # Separator on the last status row.
+    printf '\033[%d;1H\033[2K\033[2m%s\033[0m' "$v_status_lines" \
+        "$(printf '%.0s─' $(seq 1 "${COLUMNS:-80}"))"
+    printf '\033[u'                                    # restore cursor
+    printf '\033[?25h'
+}
+
+# Progress/status message: goes to the top region when split, stdout otherwise.
+status() {
+    if (( v_split == 1 )); then
+        # Keep only the most recent (v_status_lines - 1) messages; the last row
+        # is the separator.
+        printf '%s\n' "$*" >> "$v_status_file"
+        local keep=$((v_status_lines - 1))
+        tail -n "$keep" "$v_status_file" > "$v_status_file.tmp" 2>/dev/null && mv "$v_status_file.tmp" "$v_status_file"
+        split_redraw
+    else
+        printf '%s\n' "$*"
+    fi
+}
+export v_status_lines v_split v_status_file
+
+# Result line: scrolls in the lower region (or plain stdout when not split).
+# Exported so probe_host_port() can use it from `xargs`-spawned subshells.
+emit() {
+    printf '%s\n' "$*"
+}
+export -f emit
+
 v_has_masscan=0
 if command -v masscan >/dev/null 2>&1; then
     v_has_masscan=1
@@ -64,7 +156,7 @@ build_tiers() {
     local ranked="$v_workdir/ranked.txt"
     local n=0 start=1 cut
     if [[ ! -r "$v_services_file" ]]; then
-        echo "[progress] $v_services_file not found, scanning all ports in one pass." >&2
+        status "[progress] $v_services_file not found, scanning all ports in one pass."
         seq 1 65535 > "$v_workdir/tier.1"
         v_tier_count=1
         return 0
@@ -92,6 +184,9 @@ v_scan_pid=""
 v_notify_pid=""
 v_stream_pid=""
 cleanup_scan() {
+    # Restore the full-screen scroll region first: leaving DECSTBM set would
+    # confine the user's shell to the lower part of the terminal after exit.
+    split_stop
     echo "" >&2
     echo "[progress] Interrupted, stopping scanner..." >&2
     if [[ -n "$v_notify_pid" ]]; then
@@ -122,12 +217,21 @@ wait_scan() {
     v_wait_int="$2"
     v_wait_log="${3:-}"
     (
+        # This runs in a subshell, so it cannot update the parent's ring buffer
+        # in memory -- but status() works through the shared status file and
+        # writes escapes straight to the terminal, so both still apply here.
+        # The repeating "still running" line replaces its previous copy instead
+        # of filling the region, so the surrounding context stays visible.
         while kill -0 "$v_scan_pid" 2>/dev/null; do
             extra=""
             if [[ -n "$v_wait_log" && -s "$v_wait_log" ]]; then
                 extra=" | $(tr '\r' '\n' < "$v_wait_log" | grep -v '^$' | tail -1)"
             fi
-            echo "[progress] $v_wait_msg... $(date '+%H:%M:%S')$extra"
+            if (( v_split == 1 )); then
+                grep -v "^\[progress\] $v_wait_msg\.\.\. " "$v_status_file" > "$v_status_file.w" 2>/dev/null
+                mv "$v_status_file.w" "$v_status_file" 2>/dev/null
+            fi
+            status "[progress] $v_wait_msg... $(date '+%H:%M:%S')$extra"
             sleep "$v_wait_int"
         done
     ) &
@@ -161,27 +265,42 @@ if ! sudo -v; then
     exit 1
 fi
 
-echo "[progress] Discovering live hosts..."
+# Split the terminal only after the host prompt and the sudo password prompt,
+# so neither is drawn into (or cleared by) the status region.
+split_start
+
+status "[progress] Discovering live hosts..."
 v_disco_stats=""
 [[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
+# When split, discovered IPs go to the host list only -- printing them would
+# scatter them through the results region. They are summarised in the status
+# region instead. Without the split, keep the original streaming `tee` output.
+if (( v_split == 1 )); then
+    v_disco_sink="/dev/null"
+else
+    v_disco_sink="/dev/stdout"
+fi
 (
     if test -f "$v_host_def"; then
-        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" > "$v_disco_sink"
     else
-        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list"
+        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" > "$v_disco_sink"
     fi
 ) &
 v_scan_pid=$!
 wait_scan "Host discovery still running" 15
 if [[ $? -ne 0 ]]; then
-    echo "[progress] Host discovery failed" >&2
+    status "[progress] Host discovery failed"
     exit 1
 fi
 v_scan_pid=""
 
 if [[ ! -s "$v_host_list" ]]; then
-    echo "[progress] No live hosts found, nothing to scan." >&2
+    status "[progress] No live hosts found, nothing to scan."
     exit 0
+fi
+if (( v_split == 1 )); then
+    status "[progress] $(wc -l < "$v_host_list") live host(s): $(tr '\n' ' ' < "$v_host_list" | cut -c1-100)"
 fi
 
 v_port_scanner="nmap"
@@ -286,7 +405,7 @@ probe_pairs_file() {
     n=$(grep -c -- '--- Ports:' "$pending" 2>/dev/null)
     [[ -n "$n" ]] || n=0
     (( n > 0 )) || return 0
-    echo "[progress] Probing $n $label candidate(s) (${v_thread} in parallel)..."
+    status "[progress] Probing $n $label candidate(s) (${v_thread} in parallel)..."
     grep -- '--- Ports:' "$pending" | xargs -r -P "$v_thread" -I{} bash -c 'probe_host_port "{}" '"$v_wait" || true
 }
 
@@ -303,7 +422,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
     v_tier_n=$(wc -l < "$v_tier_file")
     v_port_list="$v_workdir/ports.$v_tier"
     : > "$v_port_list"
-    echo "[progress] Tier $v_tier/$v_tier_count: $v_tier_n port(s) on $v_live_hosts host(s) with $v_port_scanner..."
+    status "[progress] Tier $v_tier/$v_tier_count: $v_tier_n port(s) on $v_live_hosts host(s) with $v_port_scanner..."
     case $v_port_scanner in
         masscan)
             # Split the tier across $v_masscan_jobs shards run concurrently.
@@ -317,7 +436,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
             v_seed=$RANDOM$RANDOM
             rm -f "$v_workdir/shard.$v_tier".*
             if (( v_shards > 1 )); then
-                echo "[progress] $v_shards masscan shard(s), ${v_shard_rate} pps each (~${v_masscan_rate} pps total)"
+                status "[progress] $v_shards masscan shard(s), ${v_shard_rate} pps each (~${v_masscan_rate} pps total)"
             fi
             (
                 seq 1 "$v_shards" | xargs -r -P "$v_shards" -I{} \
@@ -371,7 +490,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
         v_stream_pid=""
     fi
     if [[ $v_rc -ne 0 ]]; then
-        echo "[progress] $v_port_scanner failed on tier $v_tier" >&2
+        status "[progress] $v_port_scanner failed on tier $v_tier"
         exit 1
     fi
     v_scan_pid=""
@@ -384,7 +503,7 @@ for v_tier in $(seq 1 "$v_tier_count"); do
     probe_pairs_file "$v_todo" "tier $v_tier"
 
     v_found=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
-    echo "[progress] Tier $v_tier done. $v_found open port(s) probed so far."
+    status "[progress] Tier $v_tier done. $v_found open port(s) probed so far."
     # Publish results after every tier so an interrupted run still leaves output.
     find "$v_workdir/results" -name '*.tmp' -exec cat {} + > http_ready.txt 2>/dev/null
 done
@@ -395,7 +514,7 @@ find "$v_workdir/results" -name '*.tmp' -exec cat {} + > http_ready.txt 2>/dev/n
 v_responded=$(grep -cvE '(http|https)_code : 000' http_ready.txt 2>/dev/null)
 [[ -n "$v_responded" ]] || v_responded=0
 v_probed=$(find "$v_workdir/results" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')
-echo "[progress] Finished. $v_responded HTTP/HTTPS response(s) from $v_probed open port(s); full log in http_ready.txt"
+status "[progress] Finished. $v_responded HTTP/HTTPS response(s) from $v_probed open port(s); full log in http_ready.txt"
 
 #-----------------------------
 #Output

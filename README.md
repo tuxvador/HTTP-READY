@@ -67,6 +67,26 @@ With `v_stream=1` (default), open ports are probed *while* the scanner is still 
 
 Press `Ctrl-C` at any time to stop the current scan cleanly (the scanner's process group is terminated). Results already probed are kept — `http_ready.txt` retains everything found by the completed tiers. Scanner status output is written to per-scanner logs (so it can't garble the terminal); masscan's live status (`% done, found=N`) is shown inline in the progress lines.
 
+### Split-screen output
+
+In a terminal, the screen is split: `[progress]` messages stay in a fixed region at the top (default 15 lines, `v_status_lines`) and results scroll underneath, separated by a rule, so the two never interleave:
+
+```
+[progress] Discovering live hosts...
+[progress] 11 live host(s): 192.168.1.12 192.168.1.33 ...
+[progress] Tier 1/4: 100 port(s) on 11 host(s) with masscan...
+[progress] 10 masscan shard(s), 5000 pps each (~50000 pps total)
+[progress] tier 1/4 (masscan)... 00:07:22
+────────────────────────────────────────────────────────────
+Host : 192.168.1.254 Port :80 +++ http://192.168.1.254:80 --- http_code : 302
+Host : 192.168.1.12 Port :443 +++ https://192.168.1.12:443 --- https_code : 200
+...
+```
+
+The status region keeps the most recent messages, and the repeating scanner-status line updates in place rather than scrolling the others away. Implemented with the VT100 scroll-region (DECSTBM) escape written directly, so it does not depend on a terminfo entry. The region is always reset on exit — including on Ctrl-C — so the terminal is never left clamped.
+
+Set `v_status_lines=0` to disable. The split turns itself off automatically when stdout is not a terminal (piped, redirected, run from cron) or when the terminal is too short, falling back to plain sequential output with no escape codes.
+
 Responding ports are printed to stdout **as each probe returns**, so hits appear live while the scan is still running rather than only in a summary at the end. Lines where the response code is `000` (nothing listening for that protocol) are suppressed from the terminal but still saved in full to `http_ready.txt`. Each open port is probed concurrently via per-port temp files to avoid output interleaving.
 
 ## Example — single host
@@ -108,6 +128,7 @@ Host : 192.168.1.30 Port :49152 +++ http://192.168.1.30:49152 --- http_code : 40
 
 ## Changes (latest)
 
+- **Split-screen output**: `[progress]` messages now stay in a fixed 15-line region at the top of the terminal (`v_status_lines`) while results scroll below it, so status and results no longer interleave. Disabled automatically when stdout is not a TTY; the scroll region is restored on every exit path including Ctrl-C
 - **Parallel masscan**: each tier is now scanned by `v_masscan_jobs` concurrent masscan shards (default 10, via `--shard i/N` with a shared `--seed`). `--rate` is divided across them so the aggregate packet rate stays at `v_masscan_rate` instead of multiplying by the shard count
 - **Live results**: responding ports print as each probe returns, instead of only in the summary after every tier finished. `000` responses stay out of the terminal but remain in `http_ready.txt`
 - **Tiered scanning**: ports are now scanned in order of real-world frequency (from `nmap-services`) instead of numerically, so common HTTP ports are found first. Coverage is unchanged — the tiers are disjoint and sum to all 65535 ports. Cut points are configurable via `v_tiers`
