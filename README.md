@@ -6,7 +6,7 @@ During pentests, some ports are not identified by nmap as HTTP/HTTPS — this sc
 
 ## Requirements
 
-- `nmap` — used for host discovery (`-sn`) and as the port-scan fallback
+- `nmap` — used for host discovery (`-sn`) and as the port-scan fallback. Its `nmap-services` file (`/usr/share/nmap/nmap-services`, path configurable via `v_services_file`) also supplies the port frequency ranking used for tiered scanning
 - `curl` — used to probe open ports with HTTP/HTTPS
 - `sudo` — required for host discovery and root port scans
 
@@ -34,11 +34,30 @@ Input is validated — only alphanumeric characters, dots, slashes, dashes, unde
 ## How it works
 
 1. **Discover live hosts** — `nmap -sn` finds which hosts are up, so port scanning only targets live hosts.
-2. **Port scan** — the first available scanner on the PATH is used: `masscan`, then `rustscan`, then `nmap`. All open ports (1-65535) are scanned.
+2. **Port scan in tiers** — the first available scanner on the PATH is used: `masscan`, then `rustscan`, then `nmap`. Ports are scanned in tiers ordered by real-world frequency (most common first), not in numeric order.
 3. **Extract host/port pairs** from the scanner output.
 4. **Probe** every open port with both `http://` and `https://` via `curl` in parallel (`v_thread` concurrent probes).
 
-Press `Ctrl-C` at any time to stop the current scan cleanly (the scanner's process group is terminated). Scanner status output is written to per-scanner logs (so it can't garble the terminal); masscan's live status (`% done, found=N`) is shown inline in the progress lines.
+All 65535 ports are still covered — tiering only changes the order they are scanned in, so hits on common HTTP ports (80, 443, 8080, …) appear within seconds instead of after a full sweep.
+
+### Tiered scanning
+
+Port order comes from the open-frequency column of `/usr/share/nmap/nmap-services`. `v_tiers` holds the cut points (default `"100 1000 8387"`), producing four tiers:
+
+| Tier | Ports | Contents |
+|------|-------|----------|
+| 1 | 100 | most common (80, 443, 22, 21, 25, …) |
+| 2 | 900 | next most common |
+| 3 | 7387 | remaining named services |
+| 4 | 57148 | everything with no `nmap-services` entry |
+
+The tiers are disjoint and sum to exactly 65535. Each tier is scanned, probed, and written to `http_ready.txt` before the next begins, so results accumulate as the run progresses. If `nmap-services` is missing, the script falls back to a single all-ports scan.
+
+### Probing during the scan
+
+With `v_stream=1` (default), open ports are probed *while* the scanner is still running — `masscan` and `nmap` flush their greppable output incrementally, so the script picks up new host/port pairs every 5s and probes them immediately rather than waiting for the scan to finish. A post-scan sweep catches anything the streamer missed, so a scanner that buffers its output costs responsiveness but never results. Probe output files are keyed by host+port, so a pair seen by both paths is probed once. Set `v_stream=0` to probe per tier only. (Streaming is skipped for `rustscan`, which writes its output at the end.)
+
+Press `Ctrl-C` at any time to stop the current scan cleanly (the scanner's process group is terminated). Results already probed are kept — `http_ready.txt` retains everything found by the completed tiers. Scanner status output is written to per-scanner logs (so it can't garble the terminal); masscan's live status (`% done, found=N`) is shown inline in the progress lines.
 
 Results are printed to stdout (filtering out lines where the response code itself is 000) and saved in full to `http_ready.txt`. Each open port is probed concurrently via per-port temp files to avoid output interleaving.
 
@@ -81,6 +100,9 @@ Host : 192.168.1.30 Port :49152 +++ http://192.168.1.30:49152 --- http_code : 40
 
 ## Changes (latest)
 
+- **Tiered scanning**: ports are now scanned in order of real-world frequency (from `nmap-services`) instead of numerically, so common HTTP ports are found first. Coverage is unchanged — the tiers are disjoint and sum to all 65535 ports. Cut points are configurable via `v_tiers`
+- **Probing during the scan** (`v_stream=1`): open ports are probed while the scanner is still running, instead of only after it exits. A post-scan sweep still catches anything missed, so no result depends on the scanner flushing early
+- **Ctrl-C keeps partial results**: `http_ready.txt` now retains everything the completed tiers found instead of being lost with the temp directory
 - Scanner priority: `masscan` → `rustscan` → `nmap` (first one found on the PATH is used)
 - Host discovery (`nmap -sn`) always runs first so port scanning only targets live hosts — full scans of a `/24` no longer waste time on down hosts
 - **Ctrl-C fix**: background jobs ignore SIGINT (POSIX), so the script now enables job control (`set -m`) and traps INT/TERM to kill the scanner's process group (SIGTERM, then SIGKILL) before exiting
