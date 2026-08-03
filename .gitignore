@@ -1,5 +1,6 @@
 # Scan output - regenerated on every run
 http_ready.txt
+live_hosts.txt
 
 # masscan resume file left behind by interrupted scans
 paused.conf

@@ -11,6 +11,11 @@ v_workdir=$(mktemp -d)
 v_host_list="${v_workdir}/hosts.nmap"
 v_port_list="${v_workdir}/ports.nmap"
 v_host_ports="${v_workdir}/host_ports.ready"
+# Discovered live hosts are written here so the terminal shows only probe
+# results. Survives the run, unlike the copy in $v_workdir.
+v_hosts_out="live_hosts.txt"
+# Set to 1 to also print the live hosts to the terminal when discovery ends.
+v_show_hosts=0
 v_wait=5
 v_thread=500
 v_nmap_stats="60s"
@@ -314,19 +319,13 @@ split_start
 status "[progress] Discovering live hosts..."
 v_disco_stats=""
 [[ $v_debug == 1 ]] && v_disco_stats="-stats-every $v_nmap_stats"
-# Discovered IPs are written to the host list; they are printed in full once
-# discovery finishes (see below) rather than streamed, so the status block is
-# not fighting the scan output for the same rows while nmap runs.
-if (( v_split == 1 )); then
-    v_disco_sink="/dev/null"
-else
-    v_disco_sink="/dev/stdout"
-fi
+# Discovered IPs go to the host list only. nmap's own stderr (the
+# --min-parallelism warning) is dropped too: the terminal is for probe results.
 (
     if test -f "$v_host_def"; then
-        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" > "$v_disco_sink"
+        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats -iL "$v_host_def" 2>"$v_workdir/discovery.log" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" > "$v_host_list"
     else
-        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" | tee "$v_host_list" > "$v_disco_sink"
+        sudo -n nmap -n -T5 --min-parallelism="$v_min_paral" --max-parallelism="$v_max_paral" -sn $v_disco_stats "$v_host_def" 2>"$v_workdir/discovery.log" | grep "scan report for" | grep -Eo "([0-9]{1,3}[\\.]){3}[0-9]{1,3}" > "$v_host_list"
     fi
 ) &
 v_scan_pid=$!
@@ -341,13 +340,15 @@ if [[ ! -s "$v_host_list" ]]; then
     status "[progress] No live hosts found, nothing to scan."
     exit 0
 fi
-if (( v_split == 1 )); then
-    # Results scroll in the normal screen area, so the host list can simply be
-    # printed there in full -- no need to fit it onto one status row.
+# The live hosts are saved rather than printed by default: only probe results
+# belong in the output. $v_host_list lives in the temp dir, which is removed on
+# exit, so copy it next to the results where it outlives the run.
+cp "$v_host_list" "$v_hosts_out" 2>/dev/null
+if (( v_show_hosts == 1 )); then
     printf '%s\n' "--- $(wc -l < "$v_host_list") live host(s) ---"
     cat "$v_host_list"
-    status "[progress] $(wc -l < "$v_host_list") live host(s), scanning ports..."
 fi
+status "[progress] $(wc -l < "$v_host_list") live host(s) -> $v_hosts_out"
 
 v_port_scanner="nmap"
 if [[ $v_has_masscan == 1 ]]; then

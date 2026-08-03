@@ -33,7 +33,7 @@ Input is validated — only alphanumeric characters, dots, slashes, dashes, unde
 
 ## How it works
 
-1. **Discover live hosts** — `nmap -sn` finds which hosts are up, so port scanning only targets live hosts.
+1. **Discover live hosts** — `nmap -sn` finds which hosts are up, so port scanning only targets live hosts. They are saved to `live_hosts.txt` rather than printed, so the terminal shows only probe results; set `v_show_hosts=1` to list them as well.
 2. **Port scan in tiers** — the first available scanner on the PATH is used: `masscan`, then `rustscan`, then `nmap`. Ports are scanned in tiers ordered by real-world frequency (most common first), not in numeric order.
 3. **Extract host/port pairs** from the scanner output.
 4. **Probe** every open port with both `http://` and `https://` via `curl` in parallel (`v_thread` concurrent probes).
